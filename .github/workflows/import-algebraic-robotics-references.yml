@@ -1,0 +1,80 @@
+name: Import algebraic robotics reference PDFs
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/import-algebraic-robotics-references.yml
+permissions:
+  contents: write
+jobs:
+  import-pdfs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download and verify the selected reference PDFs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          IMPORT_REVISION: ${{ github.sha }}
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import base64, hashlib, json, os, urllib.request
+          
+          repo = os.environ['GITHUB_REPOSITORY']
+          revision = os.environ['IMPORT_REVISION']
+          root = 'references/robotics-algebraic-geometry'
+          expected_blobs = {"2025_Wampler_Plecnik_Exceptional_Mobility.pdf":"3f08c6e15fe3a6fc828b77bfd00075e7641f959d","2026_Amethyst_Hauenstein_Wampler_Kinematic_Synthesis_over_Curves.pdf":"4a547e870f527d52950b2ffc505e404ea7199a5f","2026_Nakai_Terui_Mikawa_Trajectory_Planning_Certification_3DOF.pdf":"c9025f6edb3ef2634be75f2f7350ee8d52c5e116","2026_Wampler_Husty_Hauenstein_Sixth_order_Singularities_3RR.pdf":"87b4f83f6c00003de4297e30066fa2995ef1e3ce"}
+          
+          def api(method, path, body=None):
+              data = None if body is None else json.dumps(body).encode('utf-8')
+              request = urllib.request.Request(
+                  'https://api.github.com/repos/' + repo + '/' + path,
+                  data=data, method=method,
+                  headers={'Authorization': 'Bearer ' + os.environ['GITHUB_TOKEN'],
+                           'Accept': 'application/vnd.github+json',
+                           'Content-Type': 'application/json',
+                           'User-Agent': 'matlib-reference-import'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  return json.load(response)
+          
+          document = api('GET', 'contents/' + root + '/references.json?ref=' + revision)
+          manifest = json.loads(base64.b64decode(document['content']))
+          head = api('GET', 'git/ref/heads/main')['object']['sha']
+          commit = api('GET', 'git/commits/' + head)
+          tree_data = api('GET', 'git/trees/' + commit['tree']['sha'] + '?recursive=1')
+          assert not tree_data.get('truncated'), 'Cannot inspect the full repository tree'
+          existing = {item['path']: item for item in tree_data['tree']}
+          entries = []
+          for reference in manifest['references']:
+              if reference['fulltext_status'] != 'downloaded':
+                  continue
+              filename = reference['local_file']
+              assert filename in expected_blobs, 'Unexpected PDF in manifest'
+              path = root + '/' + filename
+              if path in existing:
+                  assert existing[path]['sha'] == expected_blobs[filename], 'Existing file differs: ' + path
+                  print('Verified existing PDF:', filename)
+                  continue
+              request = urllib.request.Request(reference['source_url'],
+                  headers={'User-Agent': 'Mozilla/5.0 Matlib-reference-import'})
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  data = response.read(20 * 1024 * 1024 + 1)
+              assert data.startswith(b'%PDF-') and b'%%EOF' in data[-8192:], 'Invalid PDF: ' + filename
+              assert len(data) == reference['size_bytes'], 'Size differs: ' + filename
+              assert hashlib.sha256(data).hexdigest() == reference['sha256'], 'SHA-256 differs: ' + filename
+              git_sha = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              assert git_sha == expected_blobs[filename], 'Git blob differs: ' + filename
+              blob = api('POST', 'git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})
+              assert blob['sha'] == git_sha, 'Uploaded blob differs: ' + filename
+              entries.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': git_sha})
+              print('Imported verified PDF:', filename)
+          
+          if entries:
+              tree = api('POST', 'git/trees', {'base_tree': commit['tree']['sha'], 'tree': entries})
+              new_commit = api('POST', 'git/commits', {'message': 'Import verified algebraic robotics reference PDFs',
+                  'tree': tree['sha'], 'parents': [head]})
+              api('PATCH', 'git/refs/heads/main', {'sha': new_commit['sha'], 'force': False})
+              print('PDF import commit:', new_commit['sha'])
+          else:
+              print('All four PDFs are already present and verified.')
+          PY
